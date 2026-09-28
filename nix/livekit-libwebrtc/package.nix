@@ -131,6 +131,8 @@ stdenv.mkDerivation {
     ./0001-shared-libraries.patch
     # Borrow a patch from chromium to prevent a build failure due to missing libclang libraries
     ./chromium-129-rust.patch
+  ] ++ lib.optionals stdenv.hostPlatform.isLinux [
+    ./pipewire-1.5.patch
   ];
 
   postPatch = ''
