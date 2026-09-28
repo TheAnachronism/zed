@@ -1,5 +1,5 @@
 use super::*;
-use project::snippet_provider::{Snippet, SnippetSource};
+use project::snippet_provider::{Snippet, SnippetSource, SourcedSnippet};
 
 impl Editor {
     pub fn set_completion_provider(&mut self, provider: Option<Rc<dyn CompletionProvider>>) {
@@ -1289,6 +1289,8 @@ fn snippet_completions(
         }
 
         for (language_ix, (_scope, snippets)) in scopes.into_iter().enumerate() {
+            let colliding_prefixes = colliding_project_personal_prefixes(&snippets);
+
             // Sort snippets by word count to match longer snippet prefixes first.
             let mut sorted_snippet_candidates = snippets
                 .iter()
@@ -1438,7 +1440,11 @@ fn snippet_completions(
                         lsp_defaults: None,
                     },
                     label: CodeLabel {
-                        text: format!("{matching_prefix} {}", snippet_source_label(&source)),
+                        text: if colliding_prefixes.contains(matching_prefix.as_str()) {
+                            format!("{matching_prefix} {}", snippet_source_label(&source))
+                        } else {
+                            matching_prefix.clone()
+                        },
                         runs: Vec::new(),
                         filter_range: 0..matching_prefix.len(),
                     },
@@ -1621,6 +1627,26 @@ fn snippet_source_label(source: &SnippetSource) -> &'static str {
         SnippetSource::Personal => "Personal",
         SnippetSource::Extension => "Extension",
     }
+}
+
+fn colliding_project_personal_prefixes(snippets: &[SourcedSnippet]) -> HashSet<&str> {
+    let mut project_prefixes = HashSet::default();
+    let mut personal_prefixes = HashSet::default();
+    for sourced in snippets {
+        match sourced.source {
+            SnippetSource::Project => {
+                project_prefixes.extend(sourced.snippet.prefix.iter().map(String::as_str));
+            }
+            SnippetSource::Personal => {
+                personal_prefixes.extend(sourced.snippet.prefix.iter().map(String::as_str));
+            }
+            SnippetSource::Extension => {}
+        }
+    }
+    project_prefixes
+        .into_iter()
+        .filter(|prefix| personal_prefixes.contains(prefix))
+        .collect()
 }
 
 /// Same-prefix snippets from different sources or languages must not collapse.

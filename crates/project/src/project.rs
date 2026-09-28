@@ -123,7 +123,7 @@ use snippet::Snippet;
 pub use snippet_provider;
 use snippet_provider::SnippetProvider;
 
-use project_snippets::{ProjectSnippetEvent, ProjectSnippetStore};
+use project_snippets::{ProjectSnippetEvent, ProjectSnippetMode, ProjectSnippetStore};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -1382,8 +1382,7 @@ impl Project {
                     worktree_store.clone(),
                     buffer_store.clone(),
                     lsp_store.clone(),
-                    true,
-                    true,
+                    ProjectSnippetMode::Load,
                     cx,
                 )
             });
@@ -1623,8 +1622,7 @@ impl Project {
                     worktree_store.clone(),
                     buffer_store.clone(),
                     lsp_store.clone(),
-                    true,
-                    true,
+                    ProjectSnippetMode::Load,
                     cx,
                 )
             });
@@ -1938,14 +1936,12 @@ impl Project {
 
             cx.subscribe(&dap_store, Self::on_dap_store_event).detach();
 
-            // Collab guests do not load host `.zed/snippets` over the session.
             let project_snippets = cx.new(|cx| {
                 ProjectSnippetStore::new(
                     worktree_store.clone(),
                     buffer_store.clone(),
                     lsp_store.clone(),
-                    false,
-                    false,
+                    ProjectSnippetMode::CollabGuest,
                     cx,
                 )
             });
@@ -2466,7 +2462,6 @@ impl Project {
         let mut sourced = Vec::new();
         if let Some(file) = file
             && matches!(file.disk_state(), DiskState::Present { .. })
-            && !self.is_via_collab()
         {
             sourced.extend(self.project_snippets.read(cx).sourced_for_file(
                 language.as_deref(),

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use collections::{HashMap, HashSet};
@@ -37,6 +37,14 @@ pub enum ProjectSnippetEvent {
     },
 }
 
+/// Local and SSH load `.zed/snippets` and honor trust. Collab guests are a
+/// distinct mode so host files cannot be opened over the live session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectSnippetMode {
+    Load,
+    CollabGuest,
+}
+
 /// Snippets discovered under one project root's `.zed/snippets` directory.
 ///
 /// Local projects (including a collab host) load those files from disk. SSH
@@ -49,13 +57,7 @@ pub struct ProjectSnippetStore {
     buffer_store: Entity<BufferStore>,
     lsp_store: Entity<LspStore>,
     diagnostic_server_id: LanguageServerId,
-    /// When false, skip `TrustedWorktrees`. The collab host and SSH clients
-    /// pass true. Collab guests pass false because they never load project
-    /// snippet files.
-    check_trust: bool,
-    /// When false (collab guests), do not scan worktrees or open
-    /// `.zed/snippets` via buffer RPC. SSH clients keep this true.
-    load_project_files: bool,
+    mode: ProjectSnippetMode,
     roots: HashMap<WorktreeId, RootState>,
     loads: HashMap<(WorktreeId, Arc<RelPath>), Task<()>>,
     _worktree_store_subscription: Subscription,
@@ -97,21 +99,17 @@ enum DirListing {
 impl EventEmitter<ProjectSnippetEvent> for ProjectSnippetStore {}
 
 impl ProjectSnippetStore {
-    /// Local and SSH pass `load_project_files: true` and `check_trust: true`.
-    /// Collab guests pass both false so host `.zed/snippets` are not opened
-    /// over the session.
     pub fn new(
         worktree_store: Entity<WorktreeStore>,
         buffer_store: Entity<BufferStore>,
         lsp_store: Entity<LspStore>,
-        load_project_files: bool,
-        check_trust: bool,
+        mode: ProjectSnippetMode,
         cx: &mut Context<Self>,
     ) -> Self {
         let diagnostic_server_id = lsp_store.read(cx).languages.next_language_server_id();
         let worktree_store_subscription =
             cx.subscribe(&worktree_store, Self::on_worktree_store_event);
-        let trust_subscription = if load_project_files && check_trust {
+        let trust_subscription = if mode == ProjectSnippetMode::Load {
             TrustedWorktrees::try_get_global(cx)
                 .map(|trusted| cx.subscribe(&trusted, Self::on_trusted_worktrees_event))
         } else {
@@ -123,14 +121,13 @@ impl ProjectSnippetStore {
             buffer_store,
             lsp_store,
             diagnostic_server_id,
-            check_trust,
-            load_project_files,
+            mode,
             roots: HashMap::default(),
             loads: HashMap::default(),
             _worktree_store_subscription: worktree_store_subscription,
             _trust_subscription: trust_subscription,
         };
-        if load_project_files {
+        if mode == ProjectSnippetMode::Load {
             let existing = worktree_store.read(cx).worktrees().collect::<Vec<_>>();
             for worktree in existing {
                 this.attach_worktree(&worktree, cx);
@@ -142,14 +139,14 @@ impl ProjectSnippetStore {
     /// Project snippets for a saved file in the nearest visible directory root.
     ///
     /// Language-specific snippets come first, then all-language `snippets.json`.
-    /// Empty for collab guests (`load_project_files` is false).
+    /// Empty for [`ProjectSnippetMode::CollabGuest`].
     pub fn sourced_for_file(
         &self,
         language: Option<&str>,
         file: &dyn language::File,
         cx: &App,
     ) -> Vec<SourcedSnippet> {
-        if !self.load_project_files {
+        if self.mode == ProjectSnippetMode::CollabGuest {
             return Vec::new();
         }
         let Some(worktree_id) = self.nearest_directory_worktree(file, cx) else {
@@ -208,7 +205,7 @@ impl ProjectSnippetStore {
         event: &WorktreeStoreEvent,
         cx: &mut Context<Self>,
     ) {
-        if !self.load_project_files {
+        if self.mode == ProjectSnippetMode::CollabGuest {
             return;
         }
         match event {
@@ -227,7 +224,7 @@ impl ProjectSnippetStore {
         event: &TrustedWorktreesEvent,
         cx: &mut Context<Self>,
     ) {
-        if !self.check_trust {
+        if self.mode == ProjectSnippetMode::CollabGuest {
             return;
         }
         // `can_trust` emits while this store may already be updating. Defer so
@@ -285,7 +282,7 @@ impl ProjectSnippetStore {
     }
 
     fn attach_worktree(&mut self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
-        if !self.load_project_files {
+        if self.mode == ProjectSnippetMode::CollabGuest {
             return;
         }
         let worktree_id = worktree.read(cx).id();
@@ -319,7 +316,9 @@ impl ProjectSnippetStore {
     fn load_snapshot_entries(&mut self, worktree: &Entity<Worktree>, cx: &mut Context<Self>) {
         let worktree_id = worktree.read(cx).id();
         let snapshot = worktree.read(cx).snapshot();
-        let dir = snippets_dir_rel();
+        let Some(dir) = snippets_dir_rel() else {
+            return;
+        };
         let paths = snapshot
             .child_entries(dir)
             .filter(|entry| entry.is_file() && root_snippet_kind(&entry.path).is_some())
@@ -470,12 +469,16 @@ impl ProjectSnippetStore {
         }
     }
 
+    fn worktree(&self, worktree_id: WorktreeId, cx: &App) -> Option<Entity<Worktree>> {
+        self.worktree_store
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)
+    }
+
     fn uses_local_fs(&self, worktree_id: WorktreeId, cx: &App) -> bool {
         self.worktree_store.read(cx).fs().is_some()
             && self
-                .worktree_store
-                .read(cx)
-                .worktree_for_id(worktree_id, cx)
+                .worktree(worktree_id, cx)
                 .is_some_and(|worktree| worktree.read(cx).as_local().is_some())
     }
 
@@ -499,8 +502,8 @@ impl ProjectSnippetStore {
         } else {
             // SSH remote worktrees have no local `fs()`. Opening the path as a
             // project buffer goes through remote-server RPC. Collab guests never
-            // reach here: `load_project_files` is false, so worktrees are not
-            // attached and host snippet files are not opened over the session.
+            // reach here: `ProjectSnippetMode::CollabGuest` does not attach
+            // worktrees, so host snippet files are not opened over the session.
             self.reload_via_buffer(worktree_id, path, kind, cx);
         }
     }
@@ -512,11 +515,7 @@ impl ProjectSnippetStore {
         kind: SnippetKind,
         cx: &mut Context<Self>,
     ) {
-        let Some(worktree) = self
-            .worktree_store
-            .read(cx)
-            .worktree_for_id(worktree_id, cx)
-        else {
+        let Some(worktree) = self.worktree(worktree_id, cx) else {
             return;
         };
         let Some(fs) = self.worktree_store.read(cx).fs() else {
@@ -584,11 +583,7 @@ impl ProjectSnippetStore {
         kind: SnippetKind,
         cx: &mut Context<Self>,
     ) {
-        let Some(worktree) = self
-            .worktree_store
-            .read(cx)
-            .worktree_for_id(worktree_id, cx)
-        else {
+        let Some(worktree) = self.worktree(worktree_id, cx) else {
             return;
         };
         let abs_path = worktree.read(cx).absolutize(&path);
@@ -706,9 +701,7 @@ impl ProjectSnippetStore {
             return;
         }
         let abs_path = self
-            .worktree_store
-            .read(cx)
-            .worktree_for_id(worktree_id, cx)
+            .worktree(worktree_id, cx)
             .map(|worktree| worktree.read(cx).absolutize(&path))
             .unwrap_or_else(|| PathBuf::from(path.as_unix_str()));
         let text = buffer.read(cx).text();
@@ -856,11 +849,7 @@ impl ProjectSnippetStore {
     }
 
     fn rescan_trusted(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
-        let Some(worktree) = self
-            .worktree_store
-            .read(cx)
-            .worktree_for_id(worktree_id, cx)
-        else {
+        let Some(worktree) = self.worktree(worktree_id, cx) else {
             return;
         };
         if !is_directory_root(worktree.read(cx)) {
@@ -887,15 +876,12 @@ impl ProjectSnippetStore {
     }
 
     fn snippet_dir_abs(&self, worktree_id: WorktreeId, cx: &App) -> Option<Arc<Path>> {
-        let worktree = self
-            .worktree_store
-            .read(cx)
-            .worktree_for_id(worktree_id, cx)?;
+        let worktree = self.worktree(worktree_id, cx)?;
         let worktree = worktree.read(cx);
         if worktree.as_local().is_none() {
             return None;
         }
-        Some(Arc::from(worktree.absolutize(snippets_dir_rel())))
+        Some(Arc::from(worktree.absolutize(snippets_dir_rel()?)))
     }
 
     fn bump_generation(&mut self, worktree_id: WorktreeId, path: &Arc<RelPath>) -> Option<u64> {
@@ -914,7 +900,7 @@ impl ProjectSnippetStore {
     }
 
     fn ensure_trusted(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) -> bool {
-        if !self.check_trust {
+        if self.mode == ProjectSnippetMode::CollabGuest {
             return true;
         }
         let Some(trusted) = TrustedWorktrees::try_get_global(cx) else {
@@ -933,7 +919,7 @@ impl ProjectSnippetStore {
     ) {
         let server_id = self.diagnostic_server_id;
         let abs_path = abs_path.to_path_buf();
-        let publish_summaries = self.check_trust;
+        let publish_summaries = self.mode == ProjectSnippetMode::Load;
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.set_path_diagnostics(server_id, abs_path, diagnostics, publish_summaries, cx);
         });
@@ -1010,8 +996,9 @@ fn is_directory_root(worktree: &Worktree) -> bool {
     worktree.is_visible() && !worktree.is_single_file()
 }
 
-fn snippets_dir_rel() -> &'static RelPath {
-    RelPath::from_unix_str(".zed/snippets").expect(".zed/snippets")
+fn snippets_dir_rel() -> Option<&'static RelPath> {
+    static DIR: OnceLock<Option<&'static RelPath>> = OnceLock::new();
+    *DIR.get_or_init(|| RelPath::from_unix_str(".zed/snippets").ok())
 }
 
 fn snippet_file_rel(file_name: &str) -> Option<Arc<RelPath>> {
@@ -1022,7 +1009,7 @@ fn snippet_file_rel(file_name: &str) -> Option<Arc<RelPath>> {
     if name.components().nth(1).is_some() {
         return None;
     }
-    Some(snippets_dir_rel().join(name).into_arc())
+    Some(snippets_dir_rel()?.join(name).into_arc())
 }
 
 /// `Some(kind)` when `path` is `<root>/.zed/snippets/<file>.json`.

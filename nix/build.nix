@@ -116,6 +116,8 @@ let
         (cargo-about.overrideAttrs (
           new: old: rec {
             version = "0.8.2";
+            # nixpkgs enables `cli` for newer cargo-about releases, but 0.8.2 has no such feature.
+            buildFeatures = [ ];
 
             src = fetchFromGitHub {
               owner = "EmbarkStudios";

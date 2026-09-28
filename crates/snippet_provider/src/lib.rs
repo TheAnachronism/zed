@@ -314,18 +314,6 @@ impl SnippetProvider {
             .unwrap_or_default()
     }
 
-    fn lookup_snippets<'a, const LOOKUP_GLOBALS: bool>(
-        &'a self,
-        language: &'a SnippetKind,
-        cx: &App,
-    ) -> Vec<Arc<Snippet>> {
-        let mut snippets = self.personal_snippets(language, LOOKUP_GLOBALS, cx);
-        if LOOKUP_GLOBALS {
-            snippets.extend(Self::extension_snippets(language, cx));
-        }
-        snippets
-    }
-
     fn push_sourced_snippets(
         &self,
         language: &SnippetKind,
@@ -361,16 +349,6 @@ impl SnippetProvider {
             .entry(language)
             .or_default()
             .insert(path, snippet);
-    }
-
-    pub fn snippets_for(&self, language: SnippetKind, cx: &App) -> Vec<Arc<Snippet>> {
-        let mut requested_snippets = self.lookup_snippets::<true>(&language, cx);
-
-        if language.is_some() {
-            // Look up global snippets as well.
-            requested_snippets.extend(self.lookup_snippets::<true>(&None, cx));
-        }
-        requested_snippets
     }
 
     /// Personal then extension snippets for `language`, then the same for all-language files.
@@ -413,7 +391,12 @@ mod tests {
                 .unwrap();
             let provider = SnippetProvider::new(fs.clone(), Default::default(), cx);
             cx.update_entity(&provider, |provider, cx| {
-                assert_eq!(1, provider.snippets_for(Some("ruby".to_owned()), cx).len());
+                assert_eq!(
+                    1,
+                    provider
+                        .sourced_snippets_for(Some("ruby".to_owned()), cx)
+                        .len(),
+                );
             });
         });
     }
