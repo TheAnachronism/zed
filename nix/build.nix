@@ -118,6 +118,7 @@ let
             version = "0.8.2";
             # nixpkgs enables `cli` for newer cargo-about releases, but 0.8.2 has no such feature.
             buildFeatures = [ ];
+            cargoBuildFeatures = [ ];
 
             src = fetchFromGitHub {
               owner = "EmbarkStudios";
