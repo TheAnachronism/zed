@@ -25,6 +25,7 @@ pub mod trusted_worktrees;
 pub mod worktree_store;
 
 mod environment;
+mod project_snippets;
 use buffer_diff::BufferDiff;
 use context_server_store::ContextServerStore;
 pub use environment::ProjectEnvironmentEvent;
@@ -121,6 +122,8 @@ use settings::{InvalidSettingsError, RegisterSetting, Settings, SettingsLocation
 use snippet::Snippet;
 pub use snippet_provider;
 use snippet_provider::SnippetProvider;
+
+use project_snippets::{ProjectSnippetEvent, ProjectSnippetStore};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -249,6 +252,7 @@ pub struct Project {
     search_included_history: SearchHistory,
     search_excluded_history: SearchHistory,
     snippets: Entity<SnippetProvider>,
+    project_snippets: Entity<ProjectSnippetStore>,
     environment: Entity<ProjectEnvironment>,
     settings_observer: Entity<SettingsObserver>,
     toolchain_store: Option<Entity<ToolchainStore>>,
@@ -1373,6 +1377,19 @@ impl Project {
 
             cx.subscribe(&lsp_store, Self::on_lsp_store_event).detach();
 
+            let project_snippets = cx.new(|cx| {
+                ProjectSnippetStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                    lsp_store.clone(),
+                    true,
+                    true,
+                    cx,
+                )
+            });
+            cx.subscribe(&project_snippets, Self::on_project_snippets_event)
+                .detach();
+
             Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
@@ -1388,6 +1405,7 @@ impl Project {
                 _subscriptions: vec![cx.on_release(Self::release)],
                 active_entry: None,
                 snippets,
+                project_snippets,
                 languages,
                 collab_client: client,
                 task_store,
@@ -1600,6 +1618,19 @@ impl Project {
 
             cx.subscribe(&remote, Self::on_remote_client_event).detach();
 
+            let project_snippets = cx.new(|cx| {
+                ProjectSnippetStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                    lsp_store.clone(),
+                    true,
+                    true,
+                    cx,
+                )
+            });
+            cx.subscribe(&project_snippets, Self::on_project_snippets_event)
+                .detach();
+
             let this = Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
@@ -1637,6 +1668,7 @@ impl Project {
                 ],
                 active_entry: None,
                 snippets,
+                project_snippets,
                 languages,
                 collab_client: client,
                 task_store,
@@ -1906,6 +1938,20 @@ impl Project {
 
             cx.subscribe(&dap_store, Self::on_dap_store_event).detach();
 
+            // Collab guests do not load host `.zed/snippets` over the session.
+            let project_snippets = cx.new(|cx| {
+                ProjectSnippetStore::new(
+                    worktree_store.clone(),
+                    buffer_store.clone(),
+                    lsp_store.clone(),
+                    false,
+                    false,
+                    cx,
+                )
+            });
+            cx.subscribe(&project_snippets, Self::on_project_snippets_event)
+                .detach();
+
             let mut project = Self {
                 buffer_ordered_messages_tx: tx,
                 buffer_store: buffer_store.clone(),
@@ -1920,6 +1966,7 @@ impl Project {
                 user_store: user_store.clone(),
                 task_store,
                 snippets,
+                project_snippets,
                 fs,
                 remote_client: None,
                 settings_observer: settings_observer.clone(),
@@ -2396,6 +2443,39 @@ impl Project {
     #[inline]
     pub fn snippets(&self) -> &Entity<SnippetProvider> {
         &self.snippets
+    }
+
+    /// Snippets for a completion at `file`.
+    ///
+    /// `file == None` (an untitled buffer) returns personal then extension
+    /// snippets, including `SnippetProvider::add_snippet_for_test` injections.
+    /// Project snippets are prepended only when `file` is saved
+    /// (`DiskState::Present`), from the nearest visible trusted directory root:
+    /// language file, then `snippets.json`. Duplicates are kept.
+    ///
+    /// Collab guests do not inherit the host's project snippets over the
+    /// session. Sharing is through project files on disk: a guest who opens
+    /// the same folder locally (or over SSH) loads `.zed/snippets` from that
+    /// store. The collab host and SSH clients still load project snippets.
+    pub fn snippets_for_file(
+        &self,
+        language: Option<String>,
+        file: Option<&dyn language::File>,
+        cx: &App,
+    ) -> Vec<snippet_provider::SourcedSnippet> {
+        let mut sourced = Vec::new();
+        if let Some(file) = file
+            && matches!(file.disk_state(), DiskState::Present { .. })
+            && !self.is_via_collab()
+        {
+            sourced.extend(self.project_snippets.read(cx).sourced_for_file(
+                language.as_deref(),
+                file,
+                cx,
+            ));
+        }
+        sourced.extend(self.snippets.read(cx).sourced_snippets_for(language, cx));
+        sourced
     }
 
     #[inline]
@@ -3968,6 +4048,27 @@ impl Project {
             },
             SettingsObserverEvent::GlobalTasksUpdated(_)
             | SettingsObserverEvent::GlobalDebugScenariosUpdated(_) => {}
+        }
+    }
+
+    fn on_project_snippets_event(
+        &mut self,
+        _: Entity<ProjectSnippetStore>,
+        event: &ProjectSnippetEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ProjectSnippetEvent::Toast {
+                notification_id,
+                message,
+            } => cx.emit(Event::Toast {
+                notification_id: notification_id.clone(),
+                message: message.clone(),
+                link: None,
+            }),
+            ProjectSnippetEvent::HideToast { notification_id } => cx.emit(Event::HideToast {
+                notification_id: notification_id.clone(),
+            }),
         }
     }
 

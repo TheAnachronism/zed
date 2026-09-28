@@ -1532,6 +1532,8 @@ impl CompletionsMenu {
                 sort_text: Option<&'a str>,
                 sort_kind: usize,
                 sort_label: &'a str,
+                // Last field: project-first only for identical-prefix ties.
+                sort_snippet_source: u8,
             },
             OtherMatch {
                 sort_score: Reverse<OrderedFloat<f64>>,
@@ -1595,6 +1597,10 @@ impl CompletionsMenu {
                     0
                 });
 
+                let sort_snippet_source = completion
+                    .snippet_deduplication_key
+                    .map(crate::snippet_source_rank_from_dedup_key)
+                    .unwrap_or(u8::MAX);
                 MatchTier::WordStartMatch {
                     sort_exact,
                     sort_snippet,
@@ -1604,6 +1610,7 @@ impl CompletionsMenu {
                     sort_text,
                     sort_kind,
                     sort_label,
+                    sort_snippet_source,
                 }
             }
         });

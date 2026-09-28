@@ -10065,7 +10065,6 @@ impl LspStore {
         }
     }
 
-    #[cfg(feature = "test-support")]
     pub fn update_diagnostic_entries(
         &mut self,
         server_id: LanguageServerId,
@@ -10091,6 +10090,81 @@ impl LspStore {
             cx,
         )?;
         Ok(())
+    }
+
+    /// Publish or clear disk diagnostics for one path from a non-LSP source.
+    ///
+    /// Local stores use the full merge path (buffer sets, worktree diagnostics,
+    /// collab summaries). Remote stores (SSH client, collab guest) cannot merge
+    /// through [`LocalLspStore`]; they update summaries and any open buffer.
+    pub fn set_path_diagnostics(
+        &mut self,
+        server_id: LanguageServerId,
+        abs_path: PathBuf,
+        diagnostics: Vec<DiagnosticEntry<Unclipped<PointUtf16>>>,
+        publish_summaries: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode.is_local() {
+            self.update_diagnostic_entries(server_id, abs_path, None, None, diagnostics, cx)
+                .log_err();
+            return;
+        }
+
+        let Some((worktree, relative_path)) =
+            self.worktree_store.read(cx).find_worktree(&abs_path, cx)
+        else {
+            log::debug!("skipping path diagnostics, no worktree found for path {abs_path:?}");
+            return;
+        };
+        let worktree_id = worktree.read(cx).id();
+        let project_path = ProjectPath {
+            worktree_id,
+            path: relative_path,
+        };
+
+        if publish_summaries {
+            let summary = DiagnosticSummary::new(&diagnostics);
+            let summaries_for_tree = self.diagnostic_summaries.entry(worktree_id).or_default();
+            if summary.is_empty() {
+                if let Some(summaries) = summaries_for_tree.get_mut(&project_path.path) {
+                    summaries.remove(&server_id);
+                    if summaries.is_empty() {
+                        summaries_for_tree.remove(&project_path.path);
+                    }
+                }
+                if summaries_for_tree.is_empty() {
+                    self.diagnostic_summaries.remove(&worktree_id);
+                }
+            } else {
+                summaries_for_tree
+                    .entry(project_path.path.clone())
+                    .or_default()
+                    .insert(server_id, summary);
+            }
+        }
+
+        if let Some(buffer) = self.buffer_store.read(cx).get_by_path(&project_path) {
+            let set = {
+                let snapshot = buffer.read(cx).snapshot();
+                DiagnosticSet::new(
+                    diagnostics.iter().map(|entry| DiagnosticEntry {
+                        range: entry.range.start.0..entry.range.end.0,
+                        diagnostic: entry.diagnostic.clone(),
+                        related_information: None,
+                    }),
+                    &snapshot,
+                )
+            };
+            buffer.update(cx, |buffer, cx| {
+                buffer.update_diagnostics(server_id, set, cx);
+            });
+        }
+
+        cx.emit(LspStoreEvent::DiagnosticsUpdated {
+            server_id,
+            paths: vec![project_path],
+        });
     }
 
     // A path's diagnostics are dropped per server, through the same merge machinery that

@@ -1,4 +1,5 @@
 use super::*;
+use project::snippet_provider::{Snippet, SnippetSource};
 
 impl Editor {
     pub fn set_completion_provider(&mut self, provider: Option<Rc<dyn CompletionProvider>>) {
@@ -1210,14 +1211,15 @@ fn has_strong_snippet_prefix_match(
 
     let query = query.to_lowercase();
     let is_word_char = |character| classifier.is_word(character);
-    let languages = buffer.read(cx).languages_at(buffer_anchor);
-    let snippet_store = project.snippets().read(cx);
+    let buffer = buffer.read(cx);
+    let languages = buffer.languages_at(buffer_anchor);
+    let file = buffer.file().map(Arc::as_ref);
 
     languages.iter().any(|language| {
-        snippet_store
-            .snippets_for(Some(language.snippet_scope_id()), cx)
+        project
+            .snippets_for_file(Some(language.snippet_scope_id()), file, cx)
             .iter()
-            .flat_map(|snippet| snippet.prefix.iter())
+            .flat_map(|sourced| sourced.snippet.prefix.iter())
             .flat_map(|prefix| snippet_candidate_suffixes(prefix, &is_word_char))
             .any(|candidate| candidate.to_lowercase().starts_with(&query))
     })
@@ -1230,14 +1232,19 @@ fn snippet_completions(
     classifier: CharClassifier,
     cx: &mut App,
 ) -> Task<Result<CompletionResponse>> {
-    let languages = buffer.read(cx).languages_at(buffer_anchor);
-    let snippet_store = project.snippets().read(cx);
+    let (languages, file) = {
+        let buffer_read = buffer.read(cx);
+        (
+            buffer_read.languages_at(buffer_anchor),
+            buffer_read.file().cloned(),
+        )
+    };
+    let file = file.as_deref();
 
     let scopes: Vec<_> = languages
         .iter()
         .filter_map(|language| {
-            let language_name = language.snippet_scope_id();
-            let snippets = snippet_store.snippets_for(Some(language_name), cx);
+            let snippets = project.snippets_for_file(Some(language.snippet_scope_id()), file, cx);
 
             if snippets.is_empty() {
                 None
@@ -1281,13 +1288,14 @@ fn snippet_completions(
             });
         }
 
-        for (_scope, snippets) in scopes.into_iter() {
+        for (language_ix, (_scope, snippets)) in scopes.into_iter().enumerate() {
             // Sort snippets by word count to match longer snippet prefixes first.
             let mut sorted_snippet_candidates = snippets
                 .iter()
                 .enumerate()
-                .flat_map(|(snippet_ix, snippet)| {
-                    snippet
+                .flat_map(|(snippet_ix, sourced)| {
+                    sourced
+                        .snippet
                         .prefix
                         .iter()
                         .enumerate()
@@ -1389,7 +1397,9 @@ fn snippet_completions(
             completions.extend(matches.iter().map(|(string_match, buffer_window_len)| {
                 let ((snippet_index, prefix_index), matching_prefix, _snippet_word_count) =
                     sorted_snippet_candidates[string_match.candidate_id];
-                let snippet = &snippets[snippet_index];
+                let sourced = &snippets[snippet_index];
+                let snippet = &sourced.snippet;
+                let source = sourced.source;
                 let start = buffer_offset - buffer_window_len;
                 let start = snapshot.anchor_before(start);
                 let range = start..buffer_anchor;
@@ -1428,7 +1438,7 @@ fn snippet_completions(
                         lsp_defaults: None,
                     },
                     label: CodeLabel {
-                        text: matching_prefix.clone(),
+                        text: format!("{matching_prefix} {}", snippet_source_label(&source)),
                         runs: Vec::new(),
                         filter_range: 0..matching_prefix.len(),
                     },
@@ -1444,7 +1454,12 @@ fn snippet_completions(
                     insert_text_mode: None,
                     confirm: None,
                     match_start: Some(start),
-                    snippet_deduplication_key: Some((snippet_index, prefix_index)),
+                    snippet_deduplication_key: Some(snippet_dedup_key(
+                        &source,
+                        snippet,
+                        language_ix,
+                        prefix_index,
+                    )),
                     group: None,
                 }
             }));
@@ -1590,4 +1605,39 @@ pub(crate) fn snippet_candidate_suffixes<'a>(
                 Some(chunk)
             }
         })
+}
+
+pub(crate) fn snippet_source_rank(source: &SnippetSource) -> u8 {
+    match source {
+        SnippetSource::Project => 0,
+        SnippetSource::Personal => 1,
+        SnippetSource::Extension => 2,
+    }
+}
+
+fn snippet_source_label(source: &SnippetSource) -> &'static str {
+    match source {
+        SnippetSource::Project => "Project",
+        SnippetSource::Personal => "Personal",
+        SnippetSource::Extension => "Extension",
+    }
+}
+
+/// Same-prefix snippets from different sources or languages must not collapse.
+pub(crate) fn snippet_dedup_key(
+    source: &SnippetSource,
+    snippet: &Arc<Snippet>,
+    language_ix: usize,
+    prefix_ix: usize,
+) -> (usize, usize) {
+    (
+        Arc::as_ptr(snippet) as usize,
+        ((snippet_source_rank(source) as usize) << 48)
+            | ((language_ix & 0xFFFF) << 32)
+            | (prefix_ix & 0xFFFF_FFFF),
+    )
+}
+
+pub(crate) fn snippet_source_rank_from_dedup_key(key: (usize, usize)) -> u8 {
+    (key.1 >> 48) as u8
 }

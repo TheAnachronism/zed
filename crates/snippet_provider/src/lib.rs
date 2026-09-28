@@ -22,14 +22,86 @@ pub fn init(cx: &mut App) {
     extension_snippet::init(cx);
 }
 
-/// Language name, or `None` if the snippet file is global.
-type SnippetKind = Option<String>;
+/// Language name, or `None` if the snippet file is global (`snippets.json`).
+pub type SnippetKind = Option<String>;
+
+/// Where a snippet was loaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SnippetSource {
+    Project,
+    Personal,
+    Extension,
+}
+
+/// A snippet together with its provenance for completion labeling.
+#[derive(Debug, Clone)]
+pub struct SourcedSnippet {
+    pub snippet: Arc<Snippet>,
+    pub source: SnippetSource,
+}
+
+/// A parse error from a snippet JSON file.
+#[derive(Debug, Clone)]
+pub struct SnippetFileError {
+    pub message: String,
+    /// 0-based line when the JSON parser reported a location.
+    pub line: Option<u32>,
+    /// 0-based column when the JSON parser reported a location.
+    pub column: Option<u32>,
+}
+
+impl std::fmt::Display for SnippetFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// Parsed snippet file: valid snippets plus per-body errors.
+#[derive(Debug, Default)]
+pub struct ParsedSnippetFile {
+    pub snippets: Vec<Arc<Snippet>>,
+    pub errors: Vec<SnippetFileError>,
+}
+
 fn file_stem_to_key(stem: &str) -> SnippetKind {
     if stem == "snippets" {
         None
     } else {
         Some(stem.to_owned())
     }
+}
+
+/// Language key for a snippet JSON path. `None` stem mapping is all-language (`snippets.json`).
+pub fn snippet_kind_from_path(path: &Path) -> Option<SnippetKind> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(file_stem_to_key(stem))
+}
+
+/// Parse a VS Code-style snippets file. Invalid JSON is `Err`; invalid bodies are collected
+/// while valid snippets are retained.
+pub fn parse_snippet_file(
+    contents: &str,
+    source: &Path,
+) -> Result<ParsedSnippetFile, SnippetFileError> {
+    let as_json = serde_json_lenient::from_str::<VsSnippetsFile>(contents).map_err(|error| {
+        SnippetFileError {
+            message: error.to_string(),
+            line: Some(error.line().saturating_sub(1) as u32),
+            column: Some(error.column().saturating_sub(1) as u32),
+        }
+    })?;
+    let mut parsed = ParsedSnippetFile::default();
+    for snippet in file_to_snippets(as_json, source) {
+        match snippet {
+            Ok(snippet) => parsed.snippets.push(snippet),
+            Err(error) => parsed.errors.push(SnippetFileError {
+                message: error.to_string(),
+                line: None,
+                column: None,
+            }),
+        }
+    }
+    Ok(parsed)
 }
 
 pub fn file_to_snippets(
@@ -209,9 +281,10 @@ impl SnippetProvider {
         }));
     }
 
-    fn lookup_snippets<'a, const LOOKUP_GLOBALS: bool>(
-        &'a self,
-        language: &'a SnippetKind,
+    fn personal_snippets(
+        &self,
+        language: &SnippetKind,
+        include_global_watcher: bool,
         cx: &App,
     ) -> Vec<Arc<Snippet>> {
         let mut user_snippets: Vec<_> = self
@@ -220,27 +293,61 @@ impl SnippetProvider {
             .cloned()
             .unwrap_or_default()
             .into_values()
-            .flat_map(|snippets| snippets.into_iter())
+            .flatten()
             .collect();
-        if LOOKUP_GLOBALS {
+        if include_global_watcher {
             if let Some(global_watcher) = cx.try_global::<GlobalSnippetWatcher>() {
                 user_snippets.extend(
                     global_watcher
                         .0
                         .read(cx)
-                        .lookup_snippets::<false>(language, cx),
+                        .personal_snippets(language, false, cx),
                 );
             }
-
-            let Some(registry) = SnippetRegistry::try_global(cx) else {
-                return user_snippets;
-            };
-
-            let registry_snippets = registry.get_snippets(language);
-            user_snippets.extend(registry_snippets);
         }
-
         user_snippets
+    }
+
+    fn extension_snippets(language: &SnippetKind, cx: &App) -> Vec<Arc<Snippet>> {
+        SnippetRegistry::try_global(cx)
+            .map(|registry| registry.get_snippets(language))
+            .unwrap_or_default()
+    }
+
+    fn lookup_snippets<'a, const LOOKUP_GLOBALS: bool>(
+        &'a self,
+        language: &'a SnippetKind,
+        cx: &App,
+    ) -> Vec<Arc<Snippet>> {
+        let mut snippets = self.personal_snippets(language, LOOKUP_GLOBALS, cx);
+        if LOOKUP_GLOBALS {
+            snippets.extend(Self::extension_snippets(language, cx));
+        }
+        snippets
+    }
+
+    fn push_sourced_snippets(
+        &self,
+        language: &SnippetKind,
+        out: &mut Vec<SourcedSnippet>,
+        cx: &App,
+    ) {
+        out.extend(
+            self.personal_snippets(language, true, cx)
+                .into_iter()
+                .map(|snippet| SourcedSnippet {
+                    snippet,
+                    source: SnippetSource::Personal,
+                }),
+        );
+        out.extend(
+            Self::extension_snippets(language, cx)
+                .into_iter()
+                .map(|snippet| SourcedSnippet {
+                    snippet,
+                    source: SnippetSource::Extension,
+                }),
+        );
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -264,6 +371,16 @@ impl SnippetProvider {
             requested_snippets.extend(self.lookup_snippets::<true>(&None, cx));
         }
         requested_snippets
+    }
+
+    /// Personal then extension snippets for `language`, then the same for all-language files.
+    pub fn sourced_snippets_for(&self, language: SnippetKind, cx: &App) -> Vec<SourcedSnippet> {
+        let mut sourced = Vec::new();
+        self.push_sourced_snippets(&language, &mut sourced, cx);
+        if language.is_some() {
+            self.push_sourced_snippets(&None, &mut sourced, cx);
+        }
+        sourced
     }
 }
 

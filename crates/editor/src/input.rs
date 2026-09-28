@@ -2236,13 +2236,19 @@ impl Editor {
             }
         } else if let Some(name) = &action.name {
             let project = self.project().context("no project")?;
-            let snippet_store = project.read(cx).snippets().read(cx);
-            let snippet = snippet_store
-                .snippets_for(action.language.clone(), cx)
+            let file = self
+                .buffer
+                .read(cx)
+                .text_anchor_for_position(self.selections.newest_anchor().start, cx)
+                .and_then(|(buffer, _)| buffer.read(cx).file().cloned());
+            let snippet = project
+                .read(cx)
+                .snippets_for_file(action.language.clone(), file.as_deref(), cx)
                 .into_iter()
-                .find(|snippet| snippet.name == *name)
+                .filter(|sourced| sourced.snippet.name == *name)
+                .min_by_key(|sourced| crate::snippet_source_rank(&sourced.source))
                 .context("snippet not found")?;
-            Snippet::parse(&snippet.body)?
+            Snippet::parse(&snippet.snippet.body)?
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")

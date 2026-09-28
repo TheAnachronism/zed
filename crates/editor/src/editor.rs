@@ -82,7 +82,9 @@ use collections::TypeIdHashMap;
 pub use completions::CompletionProvider;
 #[cfg(test)]
 pub(crate) use completions::snippet_candidate_suffixes;
-pub(crate) use completions::split_words;
+pub(crate) use completions::{
+    snippet_source_rank, snippet_source_rank_from_dedup_key, split_words,
+};
 use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
 pub use display_map::{
