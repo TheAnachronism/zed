@@ -18407,6 +18407,91 @@ async fn test_snippet_choices_menu_survives_completion_refresh(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_snippet_choices_filter_while_typing(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let (text, insertion_ranges) = marked_text_ranges(
+        indoc! {"
+            ˇ
+        "},
+        false,
+    );
+
+    let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| build_editor(buffer, window, cx));
+
+    editor.update_in(cx, |editor, window, cx| {
+        let snippet = Snippet::parse("${1|foo,creators,bar|}").unwrap();
+
+        editor
+            .insert_snippet(
+                &insertion_ranges
+                    .iter()
+                    .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end))
+                    .collect::<Vec<_>>(),
+                snippet,
+                window,
+                cx,
+            )
+            .unwrap();
+
+        assert!(
+            editor.context_menu_visible(),
+            "Snippet choices menu should be visible after inserting the choice tabstop",
+        );
+        {
+            let context_menu = editor.context_menu.borrow();
+            let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+                panic!("expected snippet choices menu");
+            };
+            assert_eq!(
+                menu.source,
+                crate::code_context_menus::CompletionsMenuSource::SnippetChoices,
+            );
+            assert_eq!(completion_menu_entries(menu), &["foo", "creators", "bar"]);
+        }
+
+        editor.handle_input("c", window, cx);
+        editor.handle_input("r", window, cx);
+    });
+    cx.run_until_parked();
+
+    editor.update_in(cx, |editor, window, cx| {
+        assert!(
+            editor.context_menu_visible(),
+            "Snippet choices menu should remain visible while typing a matching prefix",
+        );
+        {
+            let context_menu = editor.context_menu.borrow();
+            let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+                panic!("expected snippet choices menu after typing prefix");
+            };
+            assert_eq!(
+                menu.source,
+                crate::code_context_menus::CompletionsMenuSource::SnippetChoices,
+                "Typing a choice prefix should keep the snippet choices menu, not replace it with ordinary completions",
+            );
+            assert_eq!(
+                completion_menu_entries(menu),
+                &["creators"],
+                "Typing a prefix should filter snippet choices to matching options",
+            );
+        }
+
+        let _ = editor.confirm_completion(&ConfirmCompletion::default(), window, cx);
+        assert_eq!(
+            editor.text(cx),
+            "creators\n",
+            "Confirming a filtered choice should fill the remaining suffix",
+        );
+        assert!(
+            !editor.context_menu_visible(),
+            "Choice menu should close after confirming a choice",
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_snippet_tabstop_navigation_with_placeholders(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

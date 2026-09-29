@@ -58,6 +58,8 @@ mod editor_block_comment_tests;
 #[cfg(test)]
 mod editor_tests;
 mod signature_help;
+#[cfg(test)]
+mod snippet_completion_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 

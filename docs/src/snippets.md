@@ -63,7 +63,7 @@ In a [multi-root project](./windows-and-projects.md#adding-folders-to-a-project)
 }
 ```
 
-Choice placeholders such as `${2|tags,creators,parodies|}` show a list of options. Use the Up and Down arrow keys to select an option, then Enter to insert it.
+Choice placeholders such as `${2|tags,creators,parodies|}` show a list of options. Type to filter the list, or use the Up and Down arrow keys to select an option, then Enter to insert it.
 
 Use `${1/(.*)/${1:/downcase}/}` to insert a lowercase copy of the first placeholder. The copy updates as you edit the placeholder. For example, a snippet body of `[${1}](/${2|tags,creators,parodies,sources,categories|}/${1/(.*)/${1:/downcase}/}/)` creates a link whose final path segment follows the link text in lowercase.
 

@@ -439,6 +439,12 @@ impl Editor {
                     cx,
                 );
             }
+            // Typing into a selected choice collapses the selection, so the cursor no longer
+            // matches `initial_position`. Re-querying would replace this menu with ordinary
+            // completions (or hide it). Keep the choice list and filter it in place.
+            if menu.source == CompletionsMenuSource::SnippetChoices {
+                return;
+            }
             // When `is_incomplete` is false, no need to re-query completions when the current query
             // is a suffix of the initial query.
             let was_complete = !menu.is_incomplete;
