@@ -18290,6 +18290,76 @@ async fn test_snippet_placeholder_choices(cx: &mut TestAppContext) {
         );
 
         assert!(editor.context_menu_visible(), "There should be a matches");
+
+        {
+            let context_menu = editor.context_menu.borrow();
+            let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+                panic!("expected snippet choices menu");
+            };
+            assert_eq!(menu.selected_item, 0);
+            assert_eq!(completion_menu_entries(menu), &["", "i32", "u32"]);
+        }
+
+        editor.move_down(&MoveDown, window, cx);
+        {
+            let context_menu = editor.context_menu.borrow();
+            let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+                panic!("expected snippet choices menu after MoveDown");
+            };
+            assert_eq!(
+                menu.selected_item, 1,
+                "MoveDown should select the next snippet choice"
+            );
+        }
+        assert(
+            editor,
+            cx,
+            indoc! {"
+            type «» =•
+            "},
+        );
+
+        editor.move_up(&MoveUp, window, cx);
+        {
+            let context_menu = editor.context_menu.borrow();
+            let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+                panic!("expected snippet choices menu after MoveUp");
+            };
+            assert_eq!(
+                menu.selected_item, 0,
+                "MoveUp should select the previous snippet choice"
+            );
+        }
+        assert(
+            editor,
+            cx,
+            indoc! {"
+            type «» =•
+            "},
+        );
+
+        editor.move_down(&MoveDown, window, cx);
+        let _ = editor.confirm_completion(&ConfirmCompletion::default(), window, cx);
+        assert!(
+            editor.text(cx).contains("i32"),
+            "ConfirmCompletion should insert the selected snippet choice"
+        );
+        assert!(
+            !editor.context_menu_visible(),
+            "Choice menu should close after confirming a choice"
+        );
+
+        let ranges_before_move = editor
+            .selections
+            .ranges::<MultiBufferOffset>(&editor.display_snapshot(cx));
+        editor.move_down(&MoveDown, window, cx);
+        assert_ne!(
+            editor
+                .selections
+                .ranges::<MultiBufferOffset>(&editor.display_snapshot(cx)),
+            ranges_before_move,
+            "MoveDown should move the cursor when the choice menu is closed"
+        );
     });
 }
 
@@ -18545,6 +18615,77 @@ async fn test_snippets(cx: &mut TestAppContext) {
         a.f(one, two, three)ˇ b
         a.f(one, two, three)ˇ b
     "});
+}
+
+#[gpui::test]
+async fn test_snippet_regex_transform_mirrors_update_on_edit(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        let key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+            "keymaps/default-linux.json",
+            cx,
+        )
+        .unwrap();
+        cx.bind_keys(key_bindings);
+        cx.bind_keys([gpui::KeyBinding::new(
+            "down",
+            MoveDown,
+            Some("Editor && showing_completions"),
+        )]);
+    });
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state("ˇ");
+
+    cx.update_editor(|editor, window, cx| {
+        let snippet = Snippet::parse(
+            "[${1}](/${2|tags,creators,parodies,sources,categories|}/${1/(.*)/${1:/downcase}/}/)",
+        )
+        .unwrap();
+        let insertion_ranges = editor
+            .selections
+            .all(&editor.display_snapshot(cx))
+            .iter()
+            .map(|s| s.range())
+            .collect::<Vec<_>>();
+        editor
+            .insert_snippet(&insertion_ranges, snippet, window, cx)
+            .unwrap();
+    });
+
+    cx.assert_editor_state("[«ˇ»](/tags//)");
+
+    cx.write_to_clipboard(ClipboardItem::new_string("MixedCase".into()));
+    cx.update_editor(|editor, window, cx| {
+        editor.paste(&Paste, window, cx);
+    });
+    cx.assert_editor_state("[MixedCaseˇ](/tags/mixedcase/)");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("X", window, cx);
+    });
+    cx.assert_editor_state("[MixedCaseXˇ](/tags/mixedcasex/)");
+
+    cx.update_editor(|editor, window, cx| {
+        editor.backspace(&Backspace, window, cx);
+    });
+    cx.assert_editor_state("[MixedCaseˇ](/tags/mixedcase/)");
+
+    cx.update_editor(|editor, window, cx| {
+        assert!(editor.move_to_next_snippet_tabstop(window, cx));
+        assert!(editor.context_menu_visible());
+    });
+    cx.simulate_keystroke("down");
+    cx.update_editor(|editor, _, _| {
+        let context_menu = editor.context_menu.borrow();
+        let Some(CodeContextMenu::Completions(menu)) = context_menu.as_ref() else {
+            panic!("expected snippet choices menu");
+        };
+        assert_eq!(menu.selected_item, 1);
+    });
+    cx.simulate_keystroke("enter");
+    cx.assert_editor_state("[MixedCase](/creatorsˇ/mixedcase/)");
 }
 
 #[gpui::test]

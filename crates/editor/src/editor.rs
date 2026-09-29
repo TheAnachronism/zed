@@ -242,7 +242,7 @@ use settings::{
     update_settings_file,
 };
 use smallvec::{SmallVec, smallvec};
-use snippet::Snippet;
+use snippet::{Snippet, SnippetTransform};
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -992,6 +992,7 @@ pub struct Editor {
     deferred_selection_effects_state: Option<DeferredSelectionEffectsState>,
     autoclose_regions: Vec<AutocloseRegion>,
     snippet_stack: InvalidationStack<SnippetState>,
+    refreshing_snippet_transforms: bool,
     select_syntax_node_history: SelectSyntaxNodeHistory,
     ime_transaction: Option<TransactionId>,
     pub diagnostics_max_severity: DiagnosticSeverity,
@@ -1593,6 +1594,8 @@ struct SnippetState {
     ranges: Vec<Vec<Range<Anchor>>>,
     active_index: usize,
     choices: Vec<Option<Vec<String>>>,
+    /// Per tabstop: (source range, transform range, transform).
+    transforms: Vec<Vec<(Range<Anchor>, Range<Anchor>, SnippetTransform)>>,
 }
 
 pub struct RenameTarget {
@@ -2368,6 +2371,7 @@ impl Editor {
             deferred_selection_effects_state: None,
             autoclose_regions: Vec::new(),
             snippet_stack: InvalidationStack::default(),
+            refreshing_snippet_transforms: false,
             select_syntax_node_history: SelectSyntaxNodeHistory::default(),
             ime_transaction: None,
             active_diagnostics: ActiveDiagnostic::None,
@@ -5022,6 +5026,7 @@ impl Editor {
             is_end_tabstop: bool,
             ranges: Vec<Range<T>>,
             choices: Option<Vec<String>>,
+            transforms: Vec<(Range<T>, Range<T>, SnippetTransform)>,
         }
 
         let tabstops = self.buffer.update(cx, |buffer, cx| {
@@ -5041,12 +5046,11 @@ impl Editor {
                     let is_end_tabstop = tabstop.ranges.first().is_some_and(|tabstop| {
                         tabstop.is_empty() && tabstop.start == snippet.text.len() as isize
                     });
-                    let mut tabstop_ranges = tabstop
-                        .ranges
-                        .iter()
-                        .flat_map(|tabstop_range| {
-                            let mut delta = 0_isize;
-                            insertion_ranges.iter().map(move |insertion_range| {
+                    let expand = |tabstop_range: &Range<isize>| {
+                        let mut delta = 0_isize;
+                        insertion_ranges
+                            .iter()
+                            .map(move |insertion_range| {
                                 let insertion_start = insertion_range.start + delta;
                                 delta += snippet.text.len() as isize
                                     - (insertion_range.end - insertion_range.start) as isize;
@@ -5056,14 +5060,42 @@ impl Editor {
                                 let end = (insertion_start + tabstop_range.end).min(snapshot.len());
                                 snapshot.anchor_before(start)..snapshot.anchor_after(end)
                             })
-                        })
+                            .collect::<Vec<_>>()
+                    };
+                    let insertion_count = insertion_ranges.len();
+                    let mut sources_by_insertion = vec![Vec::new(); insertion_count];
+                    for source in tabstop.selection_ranges() {
+                        for (insertion_ix, expanded) in expand(source).into_iter().enumerate() {
+                            sources_by_insertion[insertion_ix].push(expanded);
+                        }
+                    }
+                    let mut tabstop_ranges = sources_by_insertion
+                        .iter()
+                        .flatten()
+                        .cloned()
                         .collect::<Vec<_>>();
                     tabstop_ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start, snapshot));
+                    let transforms = tabstop
+                        .transform_mirrors()
+                        .flat_map(|(range, transform)| {
+                            expand(range)
+                                .into_iter()
+                                .enumerate()
+                                .map(|(insertion_ix, dest)| {
+                                    let source = sources_by_insertion[insertion_ix]
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| dest.clone());
+                                    (source, dest, transform.clone())
+                                })
+                        })
+                        .collect();
 
                     Tabstop {
                         is_end_tabstop,
                         ranges: tabstop_ranges,
                         choices: tabstop.choices.clone(),
+                        transforms,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -5088,6 +5120,10 @@ impl Editor {
                     .iter()
                     .map(|tabstop| tabstop.choices.clone())
                     .collect();
+                let transforms = tabstops
+                    .iter()
+                    .map(|tabstop| tabstop.transforms.clone())
+                    .collect();
 
                 let ranges = tabstops
                     .into_iter()
@@ -5098,6 +5134,7 @@ impl Editor {
                     active_index: 0,
                     ranges,
                     choices,
+                    transforms,
                 });
             }
 
@@ -5205,6 +5242,7 @@ impl Editor {
                 }
             }
             if let Some(current_ranges) = snippet.ranges.get(snippet.active_index) {
+                self.apply_snippet_transforms(&snippet, cx);
                 self.change_selections(Default::default(), window, cx, |s| {
                     // Reverse order so that the first range is the newest created selection.
                     // Completions will use it and autoscroll will prioritize it.
@@ -5226,6 +5264,81 @@ impl Editor {
         }
 
         false
+    }
+
+    pub(crate) fn refresh_snippet_transforms(&mut self, cx: &mut Context<Self>) {
+        let edits = {
+            let Some(snippet) = self.snippet_stack.last() else {
+                return;
+            };
+            self.collect_snippet_transform_edits(&snippet.transforms, cx)
+        };
+        self.apply_collected_snippet_transform_edits(edits, cx);
+    }
+
+    fn apply_snippet_transforms(&mut self, snippet: &SnippetState, cx: &mut Context<Self>) {
+        let edits = self.collect_snippet_transform_edits(&snippet.transforms, cx);
+        self.apply_collected_snippet_transform_edits(edits, cx);
+    }
+
+    fn collect_snippet_transform_edits(
+        &self,
+        transforms: &[Vec<(Range<Anchor>, Range<Anchor>, SnippetTransform)>],
+        cx: &App,
+    ) -> Vec<(Range<Anchor>, String)> {
+        if self.refreshing_snippet_transforms || transforms.iter().all(|mirrors| mirrors.is_empty())
+        {
+            return Vec::new();
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut edits = Vec::new();
+        for mirrors in transforms {
+            for (source, dest, transform) in mirrors {
+                let source_text = snapshot.text_for_range(source.clone()).collect::<String>();
+                let replacement = transform.apply(&source_text);
+                let current = snapshot.text_for_range(dest.clone()).collect::<String>();
+                if current != replacement {
+                    edits.push((dest.clone(), replacement));
+                }
+            }
+        }
+        if !edits.is_empty() {
+            edits.sort_by(|a, b| b.0.start.cmp(&a.0.start, &snapshot));
+        }
+        edits
+    }
+
+    fn apply_collected_snippet_transform_edits(
+        &mut self,
+        edits: Vec<(Range<Anchor>, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if edits.is_empty() || self.refreshing_snippet_transforms {
+            return;
+        }
+        self.refreshing_snippet_transforms = true;
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.edit(edits, None, cx);
+        });
+        self.refreshing_snippet_transforms = false;
+    }
+
+    pub(crate) fn snippet_variable_map(&self, cx: &App) -> BTreeMap<String, String> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let newest = self.selections.newest_anchor();
+        let mut variables = BTreeMap::new();
+        variables.insert(
+            "TM_SELECTED_TEXT".into(),
+            snapshot.text_for_range(newest.range()).collect(),
+        );
+        if let Some((buffer, cursor)) = self
+            .buffer
+            .read(cx)
+            .text_anchor_for_position(newest.start, cx)
+        {
+            variables.extend(snippet_variables_from_buffer(&*buffer.read(cx), cursor, cx));
+        }
+        variables
     }
 
     pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10072,6 +10185,7 @@ impl Editor {
 
                 // Clean up orphaned review comments after edits
                 self.cleanup_orphaned_review_comments(cx);
+                self.refresh_snippet_transforms(cx);
 
                 if let Some(buffer) = edited_buffer {
                     if buffer.read(cx).file().is_none() {
@@ -11630,6 +11744,42 @@ impl Editor {
     }
 }
 
+fn snippet_variables_from_buffer(
+    buffer: &Buffer,
+    cursor: text::Anchor,
+    cx: &App,
+) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::new();
+    let snapshot = buffer.snapshot();
+    let point = cursor.to_point(&snapshot);
+    variables.insert("TM_LINE_INDEX".into(), point.row.to_string());
+    variables.insert("TM_LINE_NUMBER".into(), (point.row + 1).to_string());
+    let line_len = snapshot.line_len(point.row);
+    variables.insert(
+        "TM_CURRENT_LINE".into(),
+        snapshot
+            .text_for_range(
+                language::Point::new(point.row, 0)..language::Point::new(point.row, line_len),
+            )
+            .collect(),
+    );
+    if let Some(file) = buffer.file() {
+        let filename = file.file_name(cx).to_string();
+        variables.insert("TM_FILENAME".into(), filename.clone());
+        let path = file.full_path(cx);
+        let stem = Path::new(&filename)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or(filename);
+        variables.insert("TM_FILENAME_BASE".into(), stem);
+        if let Some(parent) = path.parent() {
+            variables.insert("TM_DIRECTORY".into(), parent.display().to_string());
+        }
+        variables.insert("TM_FILEPATH".into(), path.display().to_string());
+    }
+    variables
+}
+
 fn process_completion_for_edit(
     completion: &Completion,
     intent: CompletionIntent,
@@ -11660,7 +11810,8 @@ fn process_completion_for_edit(
         {
             snippet_source = label;
         }
-        match Snippet::parse(&snippet_source).log_err() {
+        let variables = snippet_variables_from_buffer(&*buffer, *cursor_position, cx);
+        match Snippet::parse_with_resolver(&snippet_source, &variables).log_err() {
             Some(parsed_snippet) => (Some(parsed_snippet.clone()), parsed_snippet.text),
             None => (None, completion.new_text.clone()),
         }

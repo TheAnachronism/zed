@@ -2228,9 +2228,10 @@ impl Editor {
             .map(|selection| selection.range())
             .collect_vec();
 
+        let variables = self.snippet_variable_map(cx);
         let snippet = if let Some(snippet_body) = &action.snippet {
             if action.language.is_none() && action.name.is_none() {
-                Snippet::parse(snippet_body)?
+                Snippet::parse_with_resolver(snippet_body, &variables)?
             } else {
                 bail!("`snippet` is mutually exclusive with `language` and `name`")
             }
@@ -2248,7 +2249,7 @@ impl Editor {
                 .filter(|sourced| sourced.snippet.name == *name)
                 .min_by_key(|sourced| crate::snippet_source_rank(&sourced.source))
                 .context("snippet not found")?;
-            Snippet::parse(&snippet.snippet.body)?
+            Snippet::parse_with_resolver(&snippet.snippet.body, &variables)?
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")

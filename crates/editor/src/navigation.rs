@@ -49,6 +49,17 @@ impl Editor {
             return;
         }
 
+        // Keymaps may dispatch MoveUp directly even while a completion menu is open.
+        if self
+            .context_menu
+            .borrow_mut()
+            .as_mut()
+            .map(|menu| menu.select_prev(self.completion_provider.as_deref(), window, cx))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         if self.mode.is_single_line() {
             cx.propagate();
             return;
@@ -266,6 +277,16 @@ impl Editor {
             return;
         }
         if self.cycle_inline_input_history(InlineInputHistoryDirection::Newer, window, cx) {
+            return;
+        }
+
+        if self
+            .context_menu
+            .borrow_mut()
+            .as_mut()
+            .map(|menu| menu.select_next(self.completion_provider.as_deref(), window, cx))
+            .unwrap_or(false)
+        {
             return;
         }
 
