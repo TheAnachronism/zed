@@ -44,7 +44,7 @@ We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automati
 
 Nix builds pin `cargo-about` to 0.8.2 in `nix/build.nix`. When updating that pin, check inherited `buildFeatures`, `cargoBuildFeatures`, and `cargoCheckFeatures`: overriding the first does not reset the others on a Nixpkgs derivation.
 
-The bundled LiveKit WebRTC Nix package applies `nix/livekit-libwebrtc/pipewire-1.5.patch` on Linux to build against PipeWire 1.5.81 and later.
+The pinned Nixpkgs `livekit-libwebrtc` package applies its `pipewire-1.5.patch` on Linux to build against PipeWire 1.5.81 and later.
 
 ## Sponsorship
 

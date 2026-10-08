@@ -239,7 +239,14 @@ let
         ZED_UPDATE_EXPLANATION = "Zed has been installed using Nix. Auto-updates have thus been disabled.";
         RELEASE_VERSION = version;
         ZED_COMMIT_SHA = lib.optionalString (commitSha != null) "${commitSha}";
-        LK_CUSTOM_WEBRTC = pkgs.callPackage ./livekit-libwebrtc/package.nix { };
+        LK_CUSTOM_WEBRTC = pkgs.livekit-libwebrtc.overrideAttrs (
+          old:
+          lib.optionalAttrs stdenv'.hostPlatform.isLinux {
+            # Wayland capture dlopens EGL/GL, so fixup would otherwise remove their search path.
+            NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -rpath ${lib.makeLibraryPath [ libglvnd ]}";
+            dontPatchELF = true;
+          }
+        );
         PROTOC = "${protobuf}/bin/protoc";
 
         CARGO_PROFILE = profile;
