@@ -30,6 +30,7 @@ Edit these files directly in your project. There is no separate command for proj
 Project snippets apply only when you edit a **saved file** whose path is inside a **trusted** opened folder. They are not offered for untitled buffers or while a project is in **Restricted Mode**.
 
 When a project has multiple opened folder roots, Zed uses snippets from the **nearest** root that contains the file you are editing.
+Opened roots that do not contain the file are ignored.
 
 If a project snippet and a personal snippet share the same trigger, both appear in completions with their sources labeled. The project snippet is listed first.
 

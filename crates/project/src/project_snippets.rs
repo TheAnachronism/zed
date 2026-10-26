@@ -183,7 +183,7 @@ impl ProjectSnippetStore {
             let root = worktree.abs_path();
             if path_style
                 .strip_prefix(abs_path.as_path(), root.as_ref())
-                .is_none()
+                .is_err()
             {
                 continue;
             }
