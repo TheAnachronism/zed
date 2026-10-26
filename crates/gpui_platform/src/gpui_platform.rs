@@ -65,6 +65,11 @@ pub fn web_init() {
 
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
+    #[cfg(target_os = "ios")]
+    {
+        gpui_ios::current_platform(headless)
+    }
+
     #[cfg(target_os = "macos")]
     {
         Rc::new(gpui_macos::MacPlatform::new(headless))
@@ -113,7 +118,7 @@ pub fn current_headless_renderer() -> anyhow::Result<Option<Box<dyn gpui::Platfo
     #[cfg(target_os = "macos")]
     {
         Ok(Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
+            gpui_macos::metal_renderer::MetalHeadlessRenderer::new()?,
         )))
     }
 

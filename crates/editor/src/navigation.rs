@@ -1707,6 +1707,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(buffer_id) = position.buffer_id() {
+            self.unfold_buffer(buffer_id, cx);
+        }
+        self.unfold_ranges(&[position..position], false, false, cx);
         let snapshot = self.snapshot(window, cx).display_snapshot;
         let position = position.to_point(&snapshot.buffer_snapshot());
         let start = snapshot
@@ -1947,7 +1951,8 @@ impl Editor {
                                 editor.cursor_top_offset(cx),
                                 cx,
                             ))
-                            .nav_history(true),
+                            .nav_history(true)
+                            .unfold(),
                             window,
                             cx,
                             |s| s.select_anchor_ranges(target_ranges),
@@ -2034,7 +2039,8 @@ impl Editor {
                                     SelectionEffects::scroll(Autoscroll::for_go_to_definition(
                                         offset, cx,
                                     ))
-                                    .nav_history(true),
+                                    .nav_history(true)
+                                    .unfold(),
                                     window,
                                     cx,
                                     |s| s.select_anchor_ranges(target_ranges),
@@ -2158,7 +2164,7 @@ impl Editor {
                 editor
                     .update(acx, |editor, ecx| {
                         editor.change_selections(
-                            SelectionEffects::scroll(Autoscroll::newest()),
+                            SelectionEffects::scroll(Autoscroll::newest()).unfold(),
                             window,
                             ecx,
                             |s| s.select_ranges(selection),
@@ -2291,7 +2297,7 @@ impl Editor {
             MultibufferSelectionMode::First => {
                 if let Some(first_range) = ranges.first() {
                     editor.change_selections(
-                        SelectionEffects::no_scroll(),
+                        SelectionEffects::no_scroll().unfold(),
                         window,
                         cx,
                         |selections| {
@@ -2308,10 +2314,15 @@ impl Editor {
                 );
             }
             MultibufferSelectionMode::All => {
-                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                    selections.clear_disjoint();
-                    selections.select_anchor_ranges(ranges);
-                });
+                editor.change_selections(
+                    SelectionEffects::no_scroll().unfold(),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.clear_disjoint();
+                        selections.select_anchor_ranges(ranges);
+                    },
+                );
             }
         });
 
@@ -2508,7 +2519,8 @@ impl Editor {
                 self.cursor_top_offset(cx),
                 cx,
             ))
-            .nav_history(record_nav_history),
+            .nav_history(record_nav_history)
+            .unfold(),
             window,
             cx,
             |s| s.select_anchor_ranges([start..end]),
